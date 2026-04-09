@@ -17,6 +17,8 @@ from collections import deque
 import time
 import os
 import urllib.request
+import threading
+import shared_state
 
 # ──────────────────────────────────────────────────────────────
 # CONSTANTS AND TUNING
@@ -314,7 +316,8 @@ class CanvasSaver:
 # PHASE 5.4 — OPTIONAL: SOUND EFFECTS HOOK
 # ══════════════════════════════════════════════════════════════
 
-class SoundEngine:
+class SoundEngine:      
+    
     """
     Plays a tone when a finger is actively drawing.
     Requires: pip install playsound  OR  pygame
@@ -556,6 +559,9 @@ def main_advanced():
     ui       = UIPanel(w, h)
     saver    = CanvasSaver()
     sound    = SoundEngine(enabled=False)
+    # local counters to detect GUI requests
+    last_save_ctr = shared_state.get("save_counter") or 0
+    last_clear_ctr = shared_state.get("clear_counter") or 0
 
     frame_delay = 1.0 / TARGET_FPS
     prev_time   = time.time()
@@ -566,6 +572,19 @@ def main_advanced():
     cv2.resizeWindow(WIN, min(w, 1280), min(h, 720))
 
     while True:
+        # honor GUI start/stop
+        if not shared_state.get("running"):
+            time.sleep(0.1)
+            # still allow GUI to request clear/save while paused
+            cur_save = shared_state.get("save_counter") or 0
+            cur_clear = shared_state.get("clear_counter") or 0
+            if cur_save > last_save_ctr:
+                saver.save(engine.composite(np.zeros((h,w,3), dtype=np.uint8)))
+                last_save_ctr = cur_save
+            if cur_clear > last_clear_ctr:
+                engine.clear()
+                last_clear_ctr = cur_clear
+            continue
         t0 = time.time()
         ret, frame = cap.read()
         if not ret:
@@ -624,6 +643,24 @@ def main_advanced():
         # UI Panel
         ui.draw(output, mode, active_fingers, fps_disp)
 
+        # Apply GUI-driven toggles
+        bloom_flag = shared_state.get("bloom")
+        if bloom_flag is not None:
+            engine.USE_BLOOM = bool(bloom_flag)
+        sound_enabled = shared_state.get("sound")
+        if sound_enabled is not None:
+            sound.enabled = bool(sound_enabled)
+
+        # Handle GUI save/clear requests
+        cur_save = shared_state.get("save_counter") or 0
+        if cur_save > last_save_ctr:
+            saver.save(output)
+            last_save_ctr = cur_save
+
+        cur_clear = shared_state.get("clear_counter") or 0
+        if cur_clear > last_clear_ctr:
+            engine.clear()
+            last_clear_ctr = cur_clear
         cv2.imshow(WIN, output)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -646,4 +683,14 @@ def main_advanced():
 
 
 if __name__ == "__main__":
-    main_advanced()
+    # Start the drawing loop in a background thread and run the control GUI in the main thread
+    t = threading.Thread(target=main_advanced, daemon=True)
+    t.start()
+    try:
+        import gui
+        gui.run_gui()
+    except Exception:
+        # If GUI fails, fall back to running headless loop
+        main_advanced()
+    shared_state.set("running", False)
+    t.join()
